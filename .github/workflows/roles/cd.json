@@ -1,0 +1,5 @@
+{
+  "sandbox": "arn:aws:iam::000000000000:role/simulated",
+  "staging": "arn:aws:iam::000000000000:role/simulated",
+  "production": "arn:aws:iam::000000000000:role/simulated"
+}

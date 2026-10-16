@@ -1,0 +1,117 @@
+# Simulated ECS deploy. "Builds" an
+# image tagged with the commit, registers a task definition and switches the service to it,
+# all against the simulated AWS CLI in tools/fake-aws. The GitHub Deployment record steps are
+# what a real deploy would use.
+name: Deploy ECS Service
+run-name: Deploy ${{ inputs.service }} to ${{ inputs.account-path }}${{ inputs.simulate-failure && ' (simulated failure)' || '' }}
+
+on:
+  workflow_call:
+    inputs:
+      account-path:
+        type: string
+        required: true
+      service:
+        type: string
+        required: true
+      simulate-failure:
+        type: boolean
+        required: false
+        default: false
+  workflow_dispatch:
+    inputs:
+      account-path:
+        type: choice
+        description: Environment to deploy to
+        required: true
+        options:
+          - sandbox
+          - staging
+          - production
+      service:
+        type: choice
+        description: Service to deploy
+        required: true
+        options:
+          - web
+          - search
+      simulate-failure:
+        type: boolean
+        description: "Simulate a deploy the circuit breaker rolls back (the job fails, the service stays put)"
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  deployments: write
+
+concurrency:
+  group: ${{ inputs.service }}-deploy-${{ inputs.account-path }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Use the simulated AWS CLI
+        run: echo "$GITHUB_WORKSPACE/tools/fake-aws" >> "$GITHUB_PATH"
+
+      - name: Set ECS config
+        id: set-ecs
+        env:
+          ACCOUNT_PATH: ${{ inputs.account-path }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          ecs=$(jq -re --arg env "$ACCOUNT_PATH" '.[$env] // error("Environment key not found: \($env)")' \
+            ".github/workflows/scripts/fe_${SERVICE}_deploy_ecs_variables.json")
+          echo "region=$(echo "$ecs" | jq -re '.region')" >> "$GITHUB_OUTPUT"
+          echo "cluster=$(echo "$ecs" | jq -re '.cluster')" >> "$GITHUB_OUTPUT"
+          echo "service=$(echo "$ecs" | jq -re '.service')" >> "$GITHUB_OUTPUT"
+
+      - name: Register new task definition
+        id: register-task
+        env:
+          CLUSTER_NAME: ${{ steps.set-ecs.outputs.cluster }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          NEW_REVISION=$(aws ecs register-task-definition --family "fe-$SERVICE-service" \
+            --image "000000000000.dkr.ecr.eu-west-1.amazonaws.com/app-$SERVICE:$(git rev-parse --short HEAD)")
+          echo "Registered $NEW_REVISION"
+          echo "new_revision=$NEW_REVISION" >> "$GITHUB_OUTPUT"
+
+      # From here on this is what a real deploy would run, apart from the simulated rollout.
+      - name: Start GitHub deployment record
+        id: deployment
+        continue-on-error: true
+        env:
+          ENVIRONMENT: ${{ inputs.account-path }}-${{ inputs.service }}
+          REF: ${{ github.sha }}
+          TASK_DEFINITION: ${{ steps.register-task.outputs.new_revision }}
+          # Prod releases are known by their tag; other deploys fall back to the short commit sha.
+          VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+        run: tools/deployment_history.sh start
+
+      - name: Deploy ECS Service
+        env:
+          REGION: ${{ steps.set-ecs.outputs.region }}
+          CLUSTER_NAME: ${{ steps.set-ecs.outputs.cluster }}
+          SERVICE_NAME: ${{ steps.set-ecs.outputs.service }}
+          TASK_NAME: ${{ steps.register-task.outputs.new_revision }}
+          SIMULATE_FAILURE: ${{ inputs.simulate-failure }}
+        run: tools/deploy_ecs.sh
+
+      - name: Finish GitHub deployment record
+        if: always() && steps.deployment.outputs.id != ''
+        continue-on-error: true
+        env:
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: tools/deployment_history.sh finish

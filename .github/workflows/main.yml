@@ -1,0 +1,28 @@
+# Every push to main that changes the app deploys both services to staging.
+name: Main
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  web-staging:
+    name: Web Staging
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      account-path: staging
+      service: web
+
+  search-staging:
+    name: Search Staging
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      account-path: staging
+      service: search

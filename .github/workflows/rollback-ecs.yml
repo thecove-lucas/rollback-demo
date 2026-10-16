@@ -1,0 +1,327 @@
+# Demo of a one-click ECS rollback. A real setup would log in to AWS where this uses the
+# simulated AWS CLI in tools/fake-aws, which keeps its state on the fake-ecs branch (hence
+# contents: write and GH_TOKEN for the whole run).
+#
+# Points an ECS service back at an earlier version without terraform, a build or migrations, so
+# a bad release can be undone in the time one rollout takes. Versions come from the GitHub
+# Deployments that every deploy records (see tools/deployment_history.sh). Migrations are not
+# reverted: the earlier version must still work with the current schema.
+#
+# One run, three jobs: choose shows what would be rolled back, confirm waits for someone to
+# approve it (the rollback-confirmation environment requires a reviewer; self-review is allowed,
+# so whoever started the run can confirm it), and only then rollback changes the service.
+name: Rollback ECS Service
+run-name: Rollback ${{ inputs.service }} in ${{ inputs.account-path }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      account-path:
+        type: choice
+        description: Environment to roll back
+        required: true
+        options:
+          - sandbox
+          - staging
+          - production
+      service:
+        type: choice
+        description: Service to roll back
+        required: true
+        options:
+          - web
+          - search
+      version:
+        type: string
+        description: "Release tag (e.g. search-v1.1.0) or commit to go back to. Leave empty for the last good version before the one running now."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  deployments: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  choose:
+    name: Choose the version
+    runs-on: ubuntu-latest
+    outputs:
+      region: ${{ steps.config.outputs.region }}
+      cluster: ${{ steps.config.outputs.cluster }}
+      service: ${{ steps.config.outputs.service }}
+      cloudfront_distribution_id: ${{ steps.config.outputs.cloudfront_distribution_id }}
+      task: ${{ steps.target.outputs.task }}
+      current_sha: ${{ steps.target.outputs.current_sha }}
+      target_sha: ${{ steps.target.outputs.target_sha }}
+      target_ref: ${{ steps.target.outputs.target_ref }}
+      from_version: ${{ steps.target.outputs.from_version }}
+      to_version: ${{ steps.target.outputs.to_version }}
+
+    steps:
+      # The staging and production roles only trust main, so a run from another ref would fail at
+      # login anyway; this stops it first with a clear reason, and keeps sandbox in line with them.
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Rollbacks run from main only, not $REF"
+          exit 1
+
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set role and ECS config
+        id: config
+        env:
+          ACCOUNT_PATH: ${{ inputs.account-path }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          case "$SERVICE" in
+            web|search) ;;
+            *) echo "::error::service must be web or search"; exit 1 ;;
+          esac
+
+          role=$(jq -re --arg env "$ACCOUNT_PATH" '.[$env] // error("Environment key not found: \($env)")' .github/workflows/roles/cd.json)
+          ecs=$(jq -re --arg env "$ACCOUNT_PATH" '.[$env] // error("Environment key not found: \($env)")' \
+            ".github/workflows/scripts/fe_${SERVICE}_deploy_ecs_variables.json")
+
+          {
+            echo "role=$role"
+            echo "region=$(echo "$ecs" | jq -re '.region')"
+            echo "cluster=$(echo "$ecs" | jq -re '.cluster')"
+            echo "service=$(echo "$ecs" | jq -re '.service')"
+            echo "cloudfront_distribution_id=$(echo "$ecs" | jq -re '.cloudfront_distribution_id')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use the simulated AWS CLI
+        run: echo "$GITHUB_WORKSPACE/tools/fake-aws" >> "$GITHUB_PATH"
+
+      - name: Choose the version to roll back to
+        id: target
+        env:
+          REGION: ${{ steps.config.outputs.region }}
+          CLUSTER_NAME: ${{ steps.config.outputs.cluster }}
+          SERVICE_NAME: ${{ steps.config.outputs.service }}
+          ACCOUNT_PATH: ${{ inputs.account-path }}
+          ENVIRONMENT: ${{ inputs.account-path }}-${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current=$(aws ecs describe-services --region "$REGION" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' --output text)
+
+          # Images are tagged with the short sha of the commit they were built from.
+          image_sha() {
+            local image
+            image=$(aws ecs describe-task-definition --region "$REGION" --task-definition "$1" \
+              --query "taskDefinition.containerDefinitions[?starts_with(name, 'app-')].image | [0]" --output text)
+            echo "${image##*:}"
+          }
+          full_sha() {
+            gh api "repos/$GITHUB_REPOSITORY/commits/$1" --jq '.sha' 2>/dev/null
+          }
+          subject() {
+            gh api "repos/$GITHUB_REPOSITORY/commits/$1" --jq '.commit.message | split("\n")[0]' 2>/dev/null \
+              || echo "(commit not found)"
+          }
+          # The release tag or short sha a deployment record is known by.
+          version_of() {
+            local version
+            version=$(jq -r '.version // empty' <<< "${1:-null}")
+            echo "${version:-${2:0:7}}"
+          }
+          # "web-v1.1.0 (bbbb222)", or just "bbbb222" when there is no release tag.
+          label() {
+            if [ "$1" = "${2:0:7}" ]; then echo "$1"; else echo "$1 (${2:0:7})"; fi
+          }
+          deployed_of() {
+            jq -r 'if .created_at then "\(.created_at[0:16] | sub("T"; " ")) UTC by \(.deployed_by)" else "-" end' <<< "${1:-null}"
+          }
+
+          current_sha=$(image_sha "$current")
+          from=$(MATCH_SHA="$current_sha" GOOD_ONLY=0 tools/deployment_history.sh find)
+
+          if [ -n "$VERSION" ]; then
+            # A release tag or a commit; GitHub resolves either to the full commit sha.
+            if ! sha=$(full_sha "$VERSION"); then
+              echo "::error::$VERSION is not a release tag or commit in this repository"
+              exit 1
+            fi
+            if [[ "$sha" == "$current_sha"* ]]; then
+              echo "::error::$VERSION is already running in $ENVIRONMENT"
+              exit 1
+            fi
+            to=$(MATCH_SHA="$sha" tools/deployment_history.sh find)
+            if [ -z "$to" ]; then
+              echo "::error::$VERSION has no good deploy to $ENVIRONMENT on the Deployments page (never deployed there, failed, or rolled back), so there is nothing to go back to"
+              exit 1
+            fi
+            target=$(jq -r '.task_definition' <<< "$to")
+          else
+            # The newest good deploy of a different commit. Deploys that failed, and versions an
+            # earlier rollback moved away from, are not good.
+            to=$(SKIP_SHA="$current_sha" tools/deployment_history.sh find)
+            if [ -z "$to" ]; then
+              echo "::error::no earlier good deploy of $ENVIRONMENT on the Deployments page to go back to"
+              exit 1
+            fi
+            target=$(jq -r '.task_definition' <<< "$to")
+          fi
+          target_sha=$(image_sha "$target")
+
+          from_version=$(version_of "$from" "$current_sha")
+          to_version=$(version_of "$to" "$target_sha")
+          from_subject=$(subject "$current_sha")
+          to_subject=$(subject "$target_sha")
+
+          title="Roll back $SERVICE_NAME in $ACCOUNT_PATH"
+          # Shown at the top of the run page while the run waits for confirmation.
+          echo "::notice title=$title::$(label "$from_version" "$current_sha") -> $(label "$to_version" "$target_sha")"
+          {
+            echo "### $title"
+            echo ""
+            echo "| | Version | Commit | Deployed |"
+            echo "|---|---|---|---|"
+            echo "| From | $from_version | \`${current_sha:0:7}\` ${from_subject//|/\\|} | $(deployed_of "$from") |"
+            echo "| **To** | **$to_version** | \`${target_sha:0:7}\` ${to_subject//|/\\|} | $(deployed_of "$to") |"
+            echo ""
+            echo "Task definition: \`${current##*/}\` -> \`${target##*/}\`"
+            echo ""
+            echo "Nothing changes until someone approves this run under Review deployments; reject or cancel the run to stop. The outcome is in the Roll back summary below."
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "task=$target"
+            echo "current_sha=$current_sha"
+            echo "target_sha=$target_sha"
+            echo "target_ref=$(full_sha "$target_sha" || echo "$target_sha")"
+            echo "from_version=$from_version"
+            echo "to_version=$to_version"
+          } >> "$GITHUB_OUTPUT"
+
+  # The run pauses here until a reviewer of the rollback-confirmation environment approves it.
+  # Nothing in this job touches AWS, so the environment does not change how roles are assumed.
+  confirm:
+    name: Confirm
+    needs: [choose]
+    runs-on: ubuntu-latest
+    environment: rollback-confirmation
+    steps:
+      - name: Confirmed
+        env:
+          FROM_VERSION: ${{ needs.choose.outputs.from_version }}
+          TO_VERSION: ${{ needs.choose.outputs.to_version }}
+        run: |
+          echo "Confirmed, rolling back $FROM_VERSION -> $TO_VERSION"
+
+  rollback:
+    name: Roll back
+    needs: [choose, confirm]
+    runs-on: ubuntu-latest
+    # Shares the deploy workflows' groups so a rollback never overlaps a rollout of the same
+    # service. Only this job takes it, so waiting for confirmation does not hold up deploys.
+    concurrency:
+      group: ${{ inputs.service }}-deploy-${{ inputs.account-path }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Use the simulated AWS CLI
+        run: echo "$GITHUB_WORKSPACE/tools/fake-aws" >> "$GITHUB_PATH"
+
+      # Someone may have deployed while the run waited; then the confirmed plan is out of date.
+      - name: Check nothing changed since it was confirmed
+        env:
+          REGION: ${{ needs.choose.outputs.region }}
+          CLUSTER_NAME: ${{ needs.choose.outputs.cluster }}
+          SERVICE_NAME: ${{ needs.choose.outputs.service }}
+          CURRENT_SHA: ${{ needs.choose.outputs.current_sha }}
+        run: |
+          set -euo pipefail
+          current=$(aws ecs describe-services --region "$REGION" --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' --output text)
+          image=$(aws ecs describe-task-definition --region "$REGION" --task-definition "$current" \
+            --query "taskDefinition.containerDefinitions[?starts_with(name, 'app-')].image | [0]" --output text)
+          if [ "${image##*:}" != "$CURRENT_SHA" ]; then
+            echo "::error::$SERVICE_NAME is now running ${image##*:}, not $CURRENT_SHA as when this run chose its target. Start a new rollback."
+            exit 1
+          fi
+
+      - name: Start GitHub deployment record
+        id: deployment
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVIRONMENT: ${{ inputs.account-path }}-${{ inputs.service }}
+          REF: ${{ needs.choose.outputs.target_ref }}
+          TASK_DEFINITION: ${{ needs.choose.outputs.task }}
+          VERSION: ${{ needs.choose.outputs.to_version }}
+          DESCRIPTION: Rollback to ${{ needs.choose.outputs.to_version }} from ${{ needs.choose.outputs.from_version }}
+        run: tools/deployment_history.sh start
+
+      - name: Roll back ECS service
+        env:
+          REGION: ${{ needs.choose.outputs.region }}
+          CLUSTER_NAME: ${{ needs.choose.outputs.cluster }}
+          SERVICE_NAME: ${{ needs.choose.outputs.service }}
+          TASK_NAME: ${{ needs.choose.outputs.task }}
+        run: tools/deploy_ecs.sh
+
+      - name: Invalidate CloudFront Cache
+        env:
+          DISTRIBUTION_ID: ${{ needs.choose.outputs.cloudfront_distribution_id }}
+        run: aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*"
+
+      - name: Finish GitHub deployment record
+        if: always() && steps.deployment.outputs.id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: tools/deployment_history.sh finish
+
+      # After the record above: a new success can mark older deploys inactive, and this must win.
+      - name: Mark the rolled back version on the Deployments page
+        if: success() && needs.choose.outputs.current_sha != needs.choose.outputs.target_sha
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVIRONMENT: ${{ inputs.account-path }}-${{ inputs.service }}
+          CURRENT_SHA: ${{ needs.choose.outputs.current_sha }}
+        run: tools/deployment_history.sh mark-rolled-back
+
+      # The Choose summary is fixed once that job ends, so the outcome goes here.
+      - name: Report the outcome
+        if: always()
+        env:
+          OUTCOME: ${{ job.status }}
+          SERVICE: ${{ inputs.service }}
+          ACCOUNT_PATH: ${{ inputs.account-path }}
+          FROM_VERSION: ${{ needs.choose.outputs.from_version }}
+          TO_VERSION: ${{ needs.choose.outputs.to_version }}
+        run: |
+          if [ "$OUTCOME" = success ]; then
+            echo "::notice title=Rolled back $SERVICE in $ACCOUNT_PATH::$FROM_VERSION -> $TO_VERSION is live"
+            {
+              echo "### Rolled back $SERVICE in $ACCOUNT_PATH"
+              echo ""
+              echo "**$TO_VERSION is live** (was $FROM_VERSION), as of $(date -u '+%Y-%m-%d %H:%M') UTC. $FROM_VERSION is marked as rolled back on the Deployments page, so a later rollback will not return to it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error title=Rollback of $SERVICE in $ACCOUNT_PATH did not finish::See the Roll back job log"
+            {
+              echo "### Rollback of $SERVICE in $ACCOUNT_PATH did not finish"
+              echo ""
+              echo "See the failed step in the Roll back job. If it failed before \`Roll back ECS service\`, the service is unchanged on $FROM_VERSION."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

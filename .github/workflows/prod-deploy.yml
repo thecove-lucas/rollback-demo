@@ -1,0 +1,28 @@
+# Publishing a release tagged web-* or search-* deploys
+# that service to production.
+name: Prod Deploy
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  web-production:
+    name: Web Production
+    if: startsWith(github.event.release.tag_name, 'web-') && !github.event.release.prerelease
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      account-path: production
+      service: web
+
+  search-production:
+    name: Search Production
+    if: startsWith(github.event.release.tag_name, 'search-') && !github.event.release.prerelease
+    uses: ./.github/workflows/deploy-ecs.yml
+    with:
+      account-path: production
+      service: search

@@ -1,0 +1,20 @@
+{
+  "sandbox": {
+    "region": "eu-west-1",
+    "cluster": "sandbox-frontend",
+    "service": "web",
+    "cloudfront_distribution_id": "SIMULATED"
+  },
+  "staging": {
+    "region": "eu-west-1",
+    "cluster": "staging-frontend",
+    "service": "web",
+    "cloudfront_distribution_id": "SIMULATED"
+  },
+  "production": {
+    "region": "eu-west-1",
+    "cluster": "production-frontend",
+    "service": "web",
+    "cloudfront_distribution_id": "SIMULATED"
+  }
+}

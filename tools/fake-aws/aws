@@ -1,0 +1,119 @@
+#!/bin/bash
+#
+# Simulated AWS CLI for this playground. Answers the handful of ECS and CloudFront calls the
+# deploy and rollback workflows make, so they run unchanged without an AWS account.
+#
+# "ECS" state lives in this repo on the fake-ecs branch, one JSON file per cluster and service:
+#   {"revisions": ["<image>", ...], "current": <revision number>}
+# Revision N is revisions[N-1]. Needs GH_TOKEN with contents: write.
+#
+# Supported:
+#   aws ecs register-task-definition --family <family> --image <image>     (playground only)
+#   aws ecs update-service --cluster <c> --service <s> --task-definition <family:N or arn>
+#   aws ecs describe-services --cluster <c> --services <s> ...             (prints the running arn)
+#   aws ecs describe-task-definition --task-definition <family:N or arn> ...  (prints the image)
+#   aws cloudfront create-invalidation ...                                  (no-op)
+# describe-task-definition and register-task-definition take the cluster from $CLUSTER_NAME,
+# since each environment stands in for a separate AWS account.
+
+set -euo pipefail
+
+: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}"
+ARN_PREFIX="arn:aws:ecs:eu-west-1:000000000000:task-definition"
+BRANCH=fake-ecs
+
+arg() {  # value after flag $1 in the remaining args
+  local flag=$1; shift
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$flag" ]; then echo "$2"; return; fi
+    shift
+  done
+}
+
+file_of() { echo "state/$1-$2.json"; }  # cluster, service
+
+read_state() {
+  gh api "repos/$GITHUB_REPOSITORY/contents/$1?ref=$BRANCH" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
+    || echo '{"revisions": [], "current": 0}'
+}
+
+write_state() {  # path, json, message; retried because parallel deploys commit to the same branch
+  local attempt sha
+  for attempt in 1 2 3 4 5; do
+    sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/$1?ref=$BRANCH" --jq '.sha' 2>/dev/null || true)
+    if gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/$1" -f branch="$BRANCH" -f message="$3" \
+        -f content="$(printf '%s\n' "$2" | base64 | tr -d '\n')" ${sha:+-f sha="$sha"} --silent 2>/dev/null; then
+      return
+    fi
+    sleep $((attempt * 2))
+  done
+  echo "fake aws: could not save $1" >&2
+  exit 1
+}
+
+# "fe-web-service:3" or a full arn -> "web 3"
+parse_td() {
+  local td=${1##*/}
+  local family=${td%%:*}
+  local service=${family#fe-}
+  echo "${service%-service} ${td##*:}"
+}
+
+service_cmd=$1
+action=$2
+shift 2
+
+case "$service_cmd $action" in
+  "ecs register-task-definition")
+    family=$(arg --family "$@"); image=$(arg --image "$@")
+    service=${family#fe-}; service=${service%-service}
+    path=$(file_of "${CLUSTER_NAME:?}" "$service")
+    state=$(read_state "$path")
+    state=$(jq -c --arg image "$image" '.revisions += [$image]' <<< "$state")
+    revision=$(jq '.revisions | length' <<< "$state")
+    write_state "$path" "$state" "Register $family:$revision ($image)"
+    echo "$ARN_PREFIX/$family:$revision"
+    ;;
+
+  "ecs update-service")
+    cluster=$(arg --cluster "$@"); service=$(arg --service "$@")
+    read -r _ revision < <(parse_td "$(arg --task-definition "$@")")
+    path=$(file_of "$cluster" "$service")
+    state=$(read_state "$path")
+    if [ "$revision" -lt 1 ] || [ "$revision" -gt "$(jq '.revisions | length' <<< "$state")" ]; then
+      echo "fake aws: no revision $revision of fe-$service-service in $cluster" >&2
+      exit 1
+    fi
+    write_state "$path" "$(jq -c --argjson r "$revision" '.current = $r' <<< "$state")" \
+      "Switch $cluster/$service to revision $revision"
+    ;;
+
+  "ecs describe-services")
+    cluster=$(arg --cluster "$@"); service=$(arg --services "$@")
+    current=$(read_state "$(file_of "$cluster" "$service")" | jq '.current')
+    if [ "$current" = 0 ]; then
+      echo "fake aws: $service has never been deployed to $cluster" >&2
+      exit 1
+    fi
+    echo "$ARN_PREFIX/fe-$service-service:$current"
+    ;;
+
+  "ecs describe-task-definition")
+    read -r service revision < <(parse_td "$(arg --task-definition "$@")")
+    image=$(read_state "$(file_of "${CLUSTER_NAME:?}" "$service")" | jq -r --argjson r "$revision" '.revisions[$r - 1] // empty')
+    if [ -z "$image" ]; then
+      echo "fake aws: no revision $revision of fe-$service-service" >&2
+      exit 1
+    fi
+    echo "$image"
+    ;;
+
+  "cloudfront create-invalidation")
+    echo "fake aws: CloudFront invalidation skipped"
+    ;;
+
+  *)
+    echo "fake aws: unsupported command: aws $service_cmd $action" >&2
+    exit 1
+    ;;
+esac
